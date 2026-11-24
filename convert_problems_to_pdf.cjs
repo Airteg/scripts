@@ -12,6 +12,7 @@
 // (e.g. PDF\Електродинаміка_Z01-Z87.pdf). It is built only when no file names are given.
 //
 //   --no-collection   do not build the collection
+//   --missing         skip every PDF that already exists in PDF\ (nothing is overwritten)
 //   --check           only check the layout, write nothing
 //
 // Fonts: DejaVu*.ttf from a pdf-fonts folder (current folder or next to the script) are
@@ -86,7 +87,9 @@ function loadTools() {
   const mathDir = installedDirectory(vscode, '', relativeMath, '8a14f0cc1b') ||
     path.join(vscode, relativeMath);
   if (!runtimeModules || !fs.existsSync(path.join(mathDir, 'katex.js'))) {
-    throw Error('Install dependencies with: npm install --prefix .md-pdf-tools katex@0.16.21 marked playwright-core');
+    throw Error('Dependencies not found (checked ' + path.join(__dirname, '.md-pdf-tools') +
+      ', the Codex runtime and VS Code markdown-math). Install them once with:\n' +
+      '  npm install --prefix "' + path.join(__dirname, '.md-pdf-tools') + '" katex@0.16.21 marked playwright-core');
   }
   const runtimeRequire = createRequire(path.join(path.dirname(runtimeModules), 'convert.cjs'));
   const bundle = fs.readFileSync(path.join(mathDir, 'katex.js'), 'utf8');
@@ -102,9 +105,11 @@ function loadTools() {
 
 // ---------- styles (same layout as the question PDFs) ----------
 
+let fontWarningShown = false;
 function fontFaces() {
   const missing = FONTS.filter(font => !fs.existsSync(path.join(FONT_DIR, font[3])));
-  if (missing.length) {
+  if (missing.length && !fontWarningShown) {
+    fontWarningShown = true;
     console.warn('WARNING: pdf-fonts is missing ' + missing.map(font => font[3]).join(', ') +
       ' — system fonts will be used instead.');
   }
@@ -153,6 +158,21 @@ function decodeHtml(text) {
     .replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
+// KaTeX quirks: "·" inside \text{} is turned into the math-only \cdotp and fails, so it is
+// written as a plain character there; Cyrillic letters directly in math mode are allowed
+// (strict: 'ignore'); "No character metrics" notices about such characters are not printed.
+function renderTex(katex, tex, displayMode) {
+  tex = tex.replace(/(\\text[a-z]*\s*\{)((?:[^{}]|\{[^{}]*\})*)\}/g,
+    (_, open, body) => open + body.replace(/·/g, '\\char"00B7{}') + '}');
+  const warn = console.warn;
+  console.warn = (...args) => { if (!/^No character metrics/.test(String(args[0]))) warn(...args); };
+  try {
+    return katex.renderToString(tex, { displayMode, output: 'html', throwOnError: true, strict: 'ignore' });
+  } finally {
+    console.warn = warn;
+  }
+}
+
 function renderMarkdown(tools, file, ctx) {
   const { marked, katex } = tools;
   const dir = path.dirname(file);
@@ -163,7 +183,7 @@ function renderMarkdown(tools, file, ctx) {
     const tex = (block ?? inline).trim().replace(/\\,(?=')/g, '');
     const token = 'ZFORMULAZ' + ctx.formulas.length + 'ZENDZ';
     try {
-      ctx.formulas.push(katex.renderToString(tex, { displayMode, output: 'html', throwOnError: true }));
+      ctx.formulas.push(renderTex(katex, tex, displayMode));
     } catch (error) {
       throw Error(path.basename(file) + ' line ' + md.slice(0, offset).split('\n').length + ': ' + error.message);
     }
@@ -212,7 +232,8 @@ async function layoutCheck(page) {
     }
     const images = [...document.images];
     const figures = [...document.querySelectorAll('svg.figure')];
-    const wanted = ['DejaVu Sans', 'KaTeX_Main'];
+    const embedded = [...document.fonts].some(font => font.family.replace(/"/g, '') === 'DejaVu Sans');
+    const wanted = embedded ? ['DejaVu Sans', 'KaTeX_Main'] : ['KaTeX_Main'];
     const loaded = [...document.fonts].filter(font => font.status === 'loaded').map(font => font.family.replace(/"/g, ''));
     return { formulas: formulas.length, images: images.length + figures.length,
       broken: images.filter(img => !img.naturalWidth).length +
@@ -250,7 +271,7 @@ async function writePdf(page, file, label) {
 async function main() {
   const args = process.argv.slice(2);
   const flags = new Set(args.filter(arg => arg.startsWith('--')));
-  const known = ['--check', '--no-collection'];
+  const known = ['--check', '--no-collection', '--missing'];
   const unknown = [...flags].filter(flag => !known.includes(flag));
   if (unknown.length) throw Error('Unknown option ' + unknown.join(' ') + '. Options: ' + known.join(' '));
   const checkOnly = flags.has('--check');
@@ -266,15 +287,25 @@ async function main() {
   const isIndex = name => /^index\.md$/i.test(name);
   const chapters = all.filter(name => !isIndex(name));
   if (!all.length) throw Error('No .md files in ' + SOURCE + ' — run the script from the folder with the .md files.');
-  const names = requested.length ? requested : chapters.concat(all.filter(isIndex));
-  const collection = !requested.length && !flags.has('--no-collection') && chapters.length > 1;
+  const code = name => name.replace(/\.md$/i, '');
+  const exists = pdf => flags.has('--missing') && fs.existsSync(path.join(OUTPUT, pdf));
+  const bookName = 'Електродинаміка_' + code(chapters[0] || '') + '-' + code(chapters[chapters.length - 1] || '') + '.pdf';
+  const skipped = [];
+  const names = (requested.length ? requested : chapters.concat(all.filter(isIndex)))
+    .filter(name => exists(code(name) + '.pdf') ? (skipped.push(code(name) + '.pdf'), false) : true);
+  let collection = !requested.length && !flags.has('--no-collection') && chapters.length > 1;
+  if (collection && exists(bookName)) { skipped.push(bookName); collection = false; }
+  if (skipped.length) {
+    console.log('SKIP ' + skipped.length + ' existing PDF: ' + (skipped.length > 6
+      ? skipped.slice(0, 3).join(', ') + ' … ' + skipped.slice(-2).join(', ') : skipped.join(', ')));
+  }
+  if (!names.length && !collection) { console.log('Nothing to do.'); return; }
 
   const tools = loadTools();
   const katexCss = pathToFileURL(tools.css).href;
   if (!checkOnly) fs.mkdirSync(OUTPUT, { recursive: true });
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'md-pdf-'));
   const preview = path.join(temporary, 'preview.html');
-  const code = name => name.replace(/\.md$/i, '');
   let browser;
   let failed = 0;
   let total = 0;
@@ -307,7 +338,6 @@ async function main() {
     // collection: index.md as the table of contents, then every file from a new page
     if (collection) {
       total++;
-      const bookName = 'Електродинаміка_' + code(chapters[0]) + '-' + code(chapters[chapters.length - 1]) + '.pdf';
       try {
         const ctx = { formulas: [] };
         const expected = { formulas: 0, images: 0 };
